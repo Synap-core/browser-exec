@@ -1,0 +1,1 @@
+# Synap Browser — Releases
