@@ -1,0 +1,316 @@
+# Desktop release: build, sign, notarize and publish the Synap desktop app.
+#
+# The app's source is the PRIVATE repo Synap-core/browser, and private repos on
+# this org get no Actions runs. This repo is public, so its runners (macOS
+# included) are free; the releases it hosts are where electron-updater, the
+# Control Plane (api.synap.live/download/*) and the landing read the installers.
+# Process: Synap-core/browser docs/RELEASE-FLOW.md §2.
+#
+# One macOS job does what the founder's Mac did (`./dev ship browser cut`):
+#   1. check out browser at `browser_ref` with the Synap Reader App's token
+#      (read-only);
+#   2. assemble the monorepo slice from browser/monorepo.json with relay-app's
+#      scripts/monorepo-workspace.mjs --app browser (the ONE home of that
+#      derivation, at the commit monorepo.json pins under `workspaceScript`);
+#   3. build browser's workspace deps and the backend (the embedded pod);
+#   4. browser/scripts/pack-desktop.sh, PLATFORMS=all ARCH=all.
+# With publish=true it signs (temporary keychain) and notarizes, and a second
+# job, the only one with contents: write, uploads through
+# `scripts/release.sh publish-local --skip-pack` (same assets, latest-mac.yml and
+# Gatekeeper gate as the Mac path). With publish=false the build is unsigned
+# and the installers are kept as a short-lived run artifact.
+#
+# Secrets: the signing ones belong to the `production` environment (required
+# reviewer, default branch only), so only an approved run on main can read them.
+# SYNAP_READER_APP_KEY is a repository secret: a dry run needs it too.
+name: Desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      browser_ref:
+        description: "Synap-core/browser commit, branch or tag to build"
+        type: string
+        required: true
+        default: main
+      publish:
+        description: "Sign, notarize and publish the release (needs the production approval)"
+        type: boolean
+        required: true
+        default: false
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    name: Pack mac, win, linux
+    runs-on: macos-14
+    timeout-minutes: 240
+    # A publish run waits here for the production reviewer, before any signing
+    # secret is read. The publish job below runs only after this one succeeded.
+    environment: ${{ inputs.publish && 'production' || '' }}
+    outputs:
+      version: ${{ steps.pins.outputs.version }}
+      browser_sha: ${{ steps.pins.outputs.browser_sha }}
+    steps:
+      # Read-only on the private repos the slice is cloned from. No fallback:
+      # without it nothing below can run, so fail here, loudly.
+      - name: Mint monorepo read token (Synap Reader App)
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.SYNAP_READER_APP_ID }}
+          private-key: ${{ secrets.SYNAP_READER_APP_KEY }}
+          owner: Synap-core
+          repositories: |
+            browser
+            app-bases
+            backend
+            control-plane-api
+            relay-app
+          permission-contents: read
+
+      # GITHUB_WORKSPACE becomes the workspace root; browser and the repos it
+      # pins are siblings in it, as on a developer machine.
+      - name: Checkout browser
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Synap-core/browser
+          ref: ${{ inputs.browser_ref }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: browser
+          persist-credentials: false
+
+      - name: Read version and pins
+        id: pins
+        working-directory: browser
+        run: |
+          # shellcheck disable=SC2016 # the $ and backticks below are JavaScript's
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("monorepo.json", "utf8"));
+            const s = m.workspaceScript;
+            if (!s || !/^[0-9a-f]{40}$/.test(s.ref)) throw new Error("monorepo.json: workspaceScript.ref must be a full sha");
+            const out = [
+              `version=${require("./package.json").version}`,
+              `script_repo=${s.repo}`,
+              `script_ref=${s.ref}`,
+              `script_path=${s.path}`,
+            ];
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, out.join("\n") + "\n");
+          '
+          echo "browser_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a version already released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pins.outputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::v$VERSION is already released on $GITHUB_REPOSITORY. Bump browser/package.json, land it on main, and run again."
+              exit 1
+            fi
+            echo "::warning::v$VERSION is already released; this dry run publishes nothing."
+          fi
+
+      - name: Checkout the workspace script (relay-app)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.pins.outputs.script_repo }}
+          ref: ${{ steps.pins.outputs.script_ref }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: relay-app
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: browser/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # Clones app-bases, backend and control-plane-api at browser's pins, writes
+      # the workspace root (members derived from browser's dependency graph,
+      # seeded with browser/monorepo.pnpm-lock.yaml) and installs.
+      - name: Assemble the monorepo slice + install
+        env:
+          CROSS_REPO_TOKEN: ${{ steps.app-token.outputs.token }}
+          SCRIPT_PATH: ${{ steps.pins.outputs.script_path }}
+        run: node "relay-app/$SCRIPT_PATH" --app browser --clone --install
+
+      # The embedded pod: apps/api/dist and the database migrate script, which
+      # pack-desktop.sh copies into the app (extraResources). This also builds
+      # the backend packages browser reads (types, markdown-core; api-types by
+      # name): first, because the app packages reach them through `link:`
+      # overrides, which pnpm's build order does not see.
+      - name: Build the backend (embedded pod + the packages browser reads)
+        working-directory: synap-backend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec turbo run build --filter=api... --filter=@synap-core/api-types
+
+      # The main process loads @synap-core/* from node_modules at runtime, so
+      # every workspace package browser depends on needs its dist/. The backend
+      # ones were built above.
+      - name: Build browser's other workspace dependencies
+        run: pnpm --filter "@synap-core/browser^..." --filter "!./synap-backend/**" run build
+
+      - name: Import the Developer ID certificate and the notarization key
+        if: ${{ inputs.publish }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          missing=""
+          for n in MACOS_CERTIFICATE MACOS_CERTIFICATE_PASSWORD APPLE_API_KEY_CONTENT APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            [ -n "${!n}" ] || missing="$missing ${n/APPLE_API_KEY_CONTENT/APPLE_API_KEY}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::publish=true needs these secrets in the production environment:$missing"
+            exit 1
+          fi
+          # A keychain of its own, not CSC_LINK: electron-builder also signs
+          # Windows with CSC_LINK (it is WIN_CSC_LINK's fallback), and the Mac
+          # path signed from a keychain identity too.
+          kc="$RUNNER_TEMP/synap-signing.keychain-db"
+          kc_pw="$(openssl rand -hex 24)"
+          echo "::add-mask::$kc_pw"
+          security create-keychain -p "$kc_pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kc_pw" "$kc"
+          umask 077
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$kc" -f pkcs12 \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$kc" > /dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          if ! security find-identity -v -p codesigning "$kc" | grep -q "Developer ID Application"; then
+            echo "::error::MACOS_CERTIFICATE holds no valid Developer ID Application identity"
+            exit 1
+          fi
+          # electron-builder wants the .p8 as a PATH.
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/AuthKey.p8"
+          {
+            echo "CSC_KEYCHAIN=$kc"
+            echo "APPLE_API_KEY=$RUNNER_TEMP/AuthKey.p8"
+          } >> "$GITHUB_ENV"
+
+      - name: Pack (pack-desktop.sh, all platforms)
+        working-directory: browser
+        env:
+          NODE_ENV: production
+          PLATFORMS: all
+          ARCH: all
+          CLEAN_DIST: "1"
+          # Dry run: never look for a signing identity.
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.publish && 'true' || 'false' }}
+          APPLE_API_KEY_ID: ${{ inputs.publish && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ inputs.publish && secrets.APPLE_API_ISSUER || '' }}
+        run: bash scripts/pack-desktop.sh
+
+      - name: Gatekeeper accepts the signed, notarized app
+        if: ${{ inputs.publish }}
+        working-directory: browser
+        env:
+          VERSION: ${{ steps.pins.outputs.version }}
+        run: |
+          for dmg in dist/Synap-"$VERSION"*.dmg; do
+            bash scripts/gatekeeper-check.sh "$dmg"
+          done
+
+      - name: Keep the installers
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: synap-desktop-${{ steps.pins.outputs.version }}
+          path: |
+            browser/dist/*.dmg
+            browser/dist/*.zip
+            browser/dist/*.blockmap
+            browser/dist/*.exe
+            browser/dist/*.AppImage
+            browser/dist/*.deb
+            browser/dist/*.yml
+          if-no-files-found: error
+          retention-days: ${{ inputs.publish && 1 || 3 }}
+
+      - name: Remove the signing keychain and key
+        if: ${{ always() && inputs.publish }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/synap-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+  publish:
+    name: Publish the release
+    needs: pack
+    if: ${{ inputs.publish }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    # The one job that writes: it creates the release on this repo with the
+    # built-in token. It reads no signing secret, and runs only after the
+    # approved, production-gated pack job succeeded.
+    permissions:
+      contents: write
+    steps:
+      - name: Mint browser read token (Synap Reader App)
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.SYNAP_READER_APP_ID }}
+          private-key: ${{ secrets.SYNAP_READER_APP_KEY }}
+          owner: Synap-core
+          repositories: browser
+          permission-contents: read
+
+      - name: Checkout browser at the packed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Synap-core/browser
+          ref: ${{ needs.pack.outputs.browser_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: browser
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: browser/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Download the installers
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: synap-desktop-${{ needs.pack.outputs.version }}
+          path: browser/dist
+
+      # publish-local overwrites an existing release under YES=1: check again
+      # here, so a release cut while this run packed is never clobbered.
+      - name: Publish (release.sh publish-local --skip-pack)
+        working-directory: browser
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.pack.outputs.version }}
+          YES: "1"
+          RELEASE_ORIGIN: >-
+            Built, signed and notarized by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            from Synap-core/browser@${{ needs.pack.outputs.browser_sha }}.
+        run: |
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v$VERSION was released while this run packed; refusing to overwrite it."
+            exit 1
+          fi
+          bash scripts/release.sh publish-local --skip-pack
