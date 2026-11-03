@@ -212,6 +212,11 @@ jobs:
         working-directory: browser
         env:
           NODE_ENV: production
+          # The macos-14 runner has 7 GB of RAM, so Node's default heap (~2 GB)
+          # is too small for `electron-vite build` (run 41742062237 died at
+          # 2,027 MB, "Reached heap limit"). The devbox (19 GB) gets a larger
+          # default heap, which is why the same build passed there.
+          NODE_OPTIONS: --max-old-space-size=6144
           PLATFORMS: all
           ARCH: all
           CLEAN_DIST: "1"
