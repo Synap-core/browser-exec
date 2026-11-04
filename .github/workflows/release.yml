@@ -18,8 +18,9 @@
 #   4. browser/scripts/pack-desktop.sh, PLATFORMS=all ARCH=all STRICT=1: every
 #      requested installer must be built, or the job fails.
 # With publish=true it signs and notarizes the macOS app (temporary keychain);
-# the Windows and Linux installers are NOT signed (no Authenticode
-# certificate). A second job, the only one with contents: write, uploads
+# the Windows and Linux installers are NOT signed (founder, 2026-11-04,
+# "Unsigned for now": card decide-windows-signing on pod session 1559c84e).
+# A second job, the only one with contents: write, uploads
 # through `scripts/release.sh publish-local --skip-pack` (the installers,
 # latest*.yml and the Gatekeeper gate). With publish=false nothing is signed
 # and the installers are kept as a short-lived run artifact.
@@ -344,7 +345,9 @@ jobs:
           RELEASE_ORIGIN: >-
             Built by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             from Synap-core/browser@${{ needs.pack.outputs.browser_sha }}.
-            The macOS app is signed and notarized; the Windows and Linux installers are not signed.
+            Signed and notarized: macOS (both DMGs and zips).
+            Not signed: Windows (installer and zip) and Linux (AppImage and .deb);
+            Windows may show a SmartScreen warning.
         run: |
           if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::v$VERSION was released while this run packed; refusing to overwrite it."
