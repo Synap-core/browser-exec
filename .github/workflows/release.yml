@@ -6,18 +6,22 @@
 # Control Plane (api.synap.live/download/*) and the landing read the installers.
 # Process: Synap-core/browser docs/RELEASE-FLOW.md §2.
 #
-# One macOS job does what the founder's Mac did (`./dev ship browser cut`):
+# Releases are built here and never on a Mac (founder, 2026-11-03). The pack
+# job (macOS runner) builds every platform:
 #   1. check out browser at `browser_ref` with the Synap Reader App's token
-#      (read-only);
+#      (read-only); with publish=true, refuse a commit that is not on browser
+#      main (a dry run only warns);
 #   2. assemble the monorepo slice from browser/monorepo.json with relay-app's
 #      scripts/monorepo-workspace.mjs --app browser (the ONE home of that
 #      derivation, at the commit monorepo.json pins under `workspaceScript`);
 #   3. build browser's workspace deps and the backend (the embedded pod);
-#   4. browser/scripts/pack-desktop.sh, PLATFORMS=all ARCH=all.
-# With publish=true it signs (temporary keychain) and notarizes, and a second
-# job, the only one with contents: write, uploads through
-# `scripts/release.sh publish-local --skip-pack` (same assets, latest-mac.yml and
-# Gatekeeper gate as the Mac path). With publish=false the build is unsigned
+#   4. browser/scripts/pack-desktop.sh, PLATFORMS=all ARCH=all STRICT=1: every
+#      requested installer must be built, or the job fails.
+# With publish=true it signs and notarizes the macOS app (temporary keychain);
+# the Windows and Linux installers are NOT signed (no Authenticode
+# certificate). A second job, the only one with contents: write, uploads
+# through `scripts/release.sh publish-local --skip-pack` (the installers,
+# latest*.yml and the Gatekeeper gate). With publish=false nothing is signed
 # and the installers are kept as a short-lived run artifact.
 #
 # Secrets: the signing ones belong to the `production` environment (required
@@ -105,6 +109,30 @@ jobs:
             fs.appendFileSync(process.env.GITHUB_OUTPUT, out.join("\n") + "\n");
           '
           echo "browser_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # A release builds only what landed on browser main: `browser_ref` may
+      # name any branch or commit, and a branch commit was never gated. This
+      # guard lives here, not in browser, so the commit it judges cannot
+      # remove it. GitHub's compare main...<sha> is "identical" or "behind"
+      # exactly when <sha> is main's head or one of its ancestors.
+      - name: Refuse a commit not on browser main
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHA: ${{ steps.pins.outputs.browser_sha }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          status="$(gh api "repos/Synap-core/browser/compare/main...$SHA" --jq .status)"
+          echo "browser@$SHA vs main: $status"
+          case "$status" in
+            identical|behind) ;;
+            *)
+              if [ "$PUBLISH" = "true" ]; then
+                echo "::error::browser@$SHA is not on browser main (compare: $status). Land it on main, then release main."
+                exit 1
+              fi
+              echo "::warning::browser@$SHA is not on browser main (compare: $status); this dry run publishes nothing."
+              ;;
+          esac
 
       - name: Refuse a version already released
         env:
@@ -212,7 +240,7 @@ jobs:
         working-directory: browser
         env:
           NODE_ENV: production
-          # The macos-14 runner has 7 GB of RAM, so Node's default heap (~2 GB)
+          # The macOS runner has 7 GB of RAM, so Node's default heap (~2 GB)
           # is too small for `electron-vite build` (run 41742062237 died at
           # 2,027 MB, "Reached heap limit"). The devbox (19 GB) gets a larger
           # default heap, which is why the same build passed there.
@@ -220,6 +248,9 @@ jobs:
           PLATFORMS: all
           ARCH: all
           CLEAN_DIST: "1"
+          # Every requested target or a red job: no silent NSIS → zip-only or
+          # AppImage+deb → AppImage-only fallback (v0.7.1 shipped with no .deb).
+          STRICT: "1"
           # Dry run: never look for a signing identity.
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.publish && 'true' || 'false' }}
           APPLE_API_KEY_ID: ${{ inputs.publish && secrets.APPLE_API_KEY_ID || '' }}
@@ -311,8 +342,9 @@ jobs:
           VERSION: ${{ needs.pack.outputs.version }}
           YES: "1"
           RELEASE_ORIGIN: >-
-            Built, signed and notarized by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Built by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             from Synap-core/browser@${{ needs.pack.outputs.browser_sha }}.
+            The macOS app is signed and notarized; the Windows and Linux installers are not signed.
         run: |
           if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::v$VERSION was released while this run packed; refusing to overwrite it."
