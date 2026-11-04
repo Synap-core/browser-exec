@@ -49,7 +49,7 @@ permissions:
 jobs:
   pack:
     name: Pack mac, win, linux
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 240
     # A publish run waits here for the production reviewer, before any signing
     # secret is read. The publish job below runs only after this one succeeded.
@@ -261,7 +261,7 @@ jobs:
     name: Publish the release
     needs: pack
     if: ${{ inputs.publish }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     # The one job that writes: it creates the release on this repo with the
     # built-in token. It reads no signing secret, and runs only after the
